@@ -1,0 +1,2383 @@
+#!/usr/bin/env python3
+
+"""
+LOCAL RESEARCH INTELLIGENCE & AGENTIC RAG
+=========================================
+
+Pipeline
+--------
+PDFs
+  ↓
+PyMuPDF extraction
+  ↓
+Cleaning + paragraph-aware chunking
+  ↓
+Sentence Transformer embeddings
+  ↓
+FAISS vector database
+  ↓
+Semantic retrieval + keyword reranking
+  ↓
+Lightweight research-agent workflow
+  ↓
+Local LLM using Ollama
+  ↓
+Grounded answer + page-level citations
+
+Features
+--------
+1. Ingest a directory of technical/research PDFs
+2. Extract text page-by-page
+3. Chunk text while preserving page metadata
+4. Create normalized embeddings
+5. Persist a FAISS index
+6. Persist chunk metadata in JSON
+7. Semantic search
+8. Lightweight lexical reranking
+9. Query expansion when retrieval is weak
+10. Local LLM generation through Ollama
+11. Source/page citations
+12. Direct source inspection
+13. SQLite library + query history
+14. Interactive research mode
+15. Retrieval evaluation using JSONL test cases
+
+Example
+-------
+python local_research_intelligence.py ingest --docs ./documents
+
+python local_research_intelligence.py ask \
+    "What methodology does the paper use for noise analysis?"
+
+python local_research_intelligence.py interactive
+
+python local_research_intelligence.py inspect \
+    --file paper.pdf \
+    --page 4
+
+python local_research_intelligence.py stats
+
+python local_research_intelligence.py evaluate evaluation.jsonl
+
+Requirements
+------------
+pip install -r requirements.txt
+
+Ollama
+------
+Install Ollama and pull a local model, e.g.
+
+    ollama pull llama3.2:3b
+
+The model must be available locally through:
+
+    http://127.0.0.1:11434
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+
+import faiss
+import fitz
+import numpy as np
+import requests
+from sentence_transformers import SentenceTransformer
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DATA_DIR = BASE_DIR / "data"
+DOCUMENTS_DIR = DATA_DIR / "documents"
+
+INDEX_FILE = DATA_DIR / "index.faiss"
+CHUNKS_FILE = DATA_DIR / "chunks.json"
+DATABASE_FILE = DATA_DIR / "library.db"
+
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
+
+DEFAULT_CHUNK_SIZE = 1200
+DEFAULT_CHUNK_OVERLAP = 180
+
+DEFAULT_TOP_K = 6
+DEFAULT_MAX_CONTEXT = 12000
+
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+@dataclass
+class DocumentRecord:
+    doc_id: str
+    file_name: str
+    file_path: str
+    sha256: str
+    page_count: int
+    added_at: float
+
+
+@dataclass
+class Chunk:
+    chunk_id: str
+    doc_id: str
+    file_name: str
+    page: int
+    chunk_index: int
+    text: str
+    char_count: int
+
+
+@dataclass
+class SearchResult:
+    chunk: Chunk
+    score: float
+    semantic_score: float
+    lexical_score: float
+
+
+# ============================================================
+# FILE / TEXT UTILITIES
+# ============================================================
+
+def ensure_directories() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sha256_file(path: Path) -> str:
+    """
+    Compute a SHA-256 hash for a file.
+
+    Used to detect whether the same PDF has already been indexed.
+    """
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        while True:
+            block = file.read(1024 * 1024)
+
+            if not block:
+                break
+
+            digest.update(block)
+
+    return digest.hexdigest()
+
+
+def clean_text(text: str) -> str:
+    """
+    Conservative PDF text cleanup.
+
+    Operations:
+    - remove null bytes
+    - repair words broken by PDF line wrapping
+    - normalize whitespace
+    - remove excessive empty lines
+    """
+
+    text = text.replace("\x00", " ")
+
+    # Example:
+    # architec-
+    # ture
+    #
+    # becomes:
+    # architecture
+    text = re.sub(
+        r"(\w)-\s*\n\s*(\w)",
+        r"\1\2",
+        text,
+    )
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
+def tokenize(text: str) -> set[str]:
+    """
+    Tokenize text for the small lexical-reranking component.
+    """
+    tokens = re.findall(
+        r"\b[a-zA-Z0-9_./+-]+\b",
+        text.lower(),
+    )
+
+    return set(tokens)
+
+
+def lexical_overlap(
+    query: str,
+    document: str,
+) -> float:
+    """
+    Calculate query/document keyword overlap.
+
+    This is only a secondary ranking feature.
+    Semantic embedding similarity remains the main retrieval signal.
+    """
+
+    query_tokens = tokenize(query)
+    document_tokens = tokenize(document)
+
+    if not query_tokens:
+        return 0.0
+
+    intersection = query_tokens.intersection(
+        document_tokens
+    )
+
+    return len(intersection) / len(query_tokens)
+
+
+# ============================================================
+# PDF EXTRACTION
+# ============================================================
+
+def extract_pdf_pages(
+    pdf_path: Path,
+) -> list[tuple[int, str]]:
+    """
+    Extract text from each PDF page.
+
+    Returns:
+        [(1, page_text), (2, page_text), ...]
+    """
+
+    pages = []
+
+    with fitz.open(pdf_path) as pdf:
+
+        for page_number, page in enumerate(
+            pdf,
+            start=1,
+        ):
+
+            text = page.get_text("text")
+
+            text = clean_text(text)
+
+            if text:
+                pages.append(
+                    (
+                        page_number,
+                        text,
+                    )
+                )
+
+    return pages
+
+
+# ============================================================
+# CHUNKING
+# ============================================================
+
+def split_text(
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[str]:
+    """
+    Paragraph-aware chunking.
+
+    The objective is to avoid splitting every N characters blindly.
+
+    Strategy:
+    - split around paragraphs
+    - accumulate paragraphs
+    - preserve overlap between consecutive chunks
+    - split oversized paragraphs using sliding windows
+    """
+
+    if chunk_size <= 0:
+        raise ValueError(
+            "chunk_size must be greater than 0"
+        )
+
+    if overlap < 0 or overlap >= chunk_size:
+        raise ValueError(
+            "overlap must satisfy 0 <= overlap < chunk_size"
+        )
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(
+            r"\n\s*\n",
+            text,
+        )
+        if paragraph.strip()
+    ]
+
+    chunks = []
+
+    current = ""
+
+    for paragraph in paragraphs:
+
+        # Handle an unusually large paragraph.
+        if len(paragraph) > chunk_size:
+
+            if current:
+                chunks.append(
+                    current.strip()
+                )
+
+                current = ""
+
+            start = 0
+
+            while start < len(paragraph):
+
+                end = start + chunk_size
+
+                window = paragraph[start:end]
+
+                chunks.append(
+                    window.strip()
+                )
+
+                start += (
+                    chunk_size - overlap
+                )
+
+            continue
+
+        # Candidate chunk if current paragraph is appended.
+        if current:
+            candidate = (
+                current
+                + "\n\n"
+                + paragraph
+            )
+        else:
+            candidate = paragraph
+
+        if len(candidate) <= chunk_size:
+
+            current = candidate
+
+        else:
+
+            if current:
+                chunks.append(
+                    current.strip()
+                )
+
+                if overlap > 0:
+
+                    overlap_text = current[
+                        -overlap:
+                    ]
+
+                    current = (
+                        overlap_text
+                        + "\n\n"
+                        + paragraph
+                    )
+
+                else:
+
+                    current = paragraph
+
+    if current.strip():
+        chunks.append(
+            current.strip()
+        )
+
+    return [
+        chunk
+        for chunk in chunks
+        if chunk.strip()
+    ]
+
+
+def build_document_chunks(
+    pdf_path: Path,
+    doc_id: str,
+    chunk_size: int,
+    overlap: int,
+) -> tuple[list[Chunk], int]:
+
+    pages = extract_pdf_pages(
+        pdf_path
+    )
+
+    chunks = []
+
+    global_chunk_index = 0
+
+    for page_number, page_text in pages:
+
+        page_chunks = split_text(
+            page_text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+
+        for page_chunk_index, text in enumerate(
+            page_chunks
+        ):
+
+            chunk = Chunk(
+                chunk_id=(
+                    f"{doc_id}-"
+                    f"chunk-"
+                    f"{global_chunk_index}"
+                ),
+                doc_id=doc_id,
+                file_name=pdf_path.name,
+                page=page_number,
+                chunk_index=page_chunk_index,
+                text=text,
+                char_count=len(text),
+            )
+
+            chunks.append(chunk)
+
+            global_chunk_index += 1
+
+    return chunks, len(pages)
+
+
+# ============================================================
+# SQLITE DATABASE
+# ============================================================
+
+class LibraryDatabase:
+
+    def __init__(
+        self,
+        database_file: Path = DATABASE_FILE,
+    ) -> None:
+
+        self.database_file = database_file
+
+        self.initialize()
+
+    def connect(self) -> sqlite3.Connection:
+
+        connection = sqlite3.connect(
+            self.database_file
+        )
+
+        connection.row_factory = sqlite3.Row
+
+        return connection
+
+    def initialize(self) -> None:
+
+        with self.connect() as connection:
+
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    doc_id TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    sha256 TEXT UNIQUE NOT NULL,
+                    page_count INTEGER NOT NULL,
+                    added_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    retrieved_chunks INTEGER NOT NULL,
+                    latency_ms REAL NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                """
+            )
+
+    def document_exists(
+        self,
+        sha256: str,
+    ) -> bool:
+
+        with self.connect() as connection:
+
+            result = connection.execute(
+                """
+                SELECT 1
+                FROM documents
+                WHERE sha256 = ?
+                LIMIT 1
+                """,
+                (sha256,),
+            ).fetchone()
+
+        return result is not None
+
+    def add_document(
+        self,
+        record: DocumentRecord,
+    ) -> bool:
+
+        try:
+
+            with self.connect() as connection:
+
+                connection.execute(
+                    """
+                    INSERT INTO documents
+                    (
+                        doc_id,
+                        file_name,
+                        file_path,
+                        sha256,
+                        page_count,
+                        added_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.doc_id,
+                        record.file_name,
+                        record.file_path,
+                        record.sha256,
+                        record.page_count,
+                        record.added_at,
+                    ),
+                )
+
+            return True
+
+        except sqlite3.IntegrityError:
+
+            return False
+
+    def log_query(
+        self,
+        question: str,
+        answer: str,
+        retrieved_chunks: int,
+        latency_ms: float,
+    ) -> None:
+
+        with self.connect() as connection:
+
+            connection.execute(
+                """
+                INSERT INTO queries
+                (
+                    question,
+                    answer,
+                    retrieved_chunks,
+                    latency_ms,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    question,
+                    answer,
+                    retrieved_chunks,
+                    latency_ms,
+                    time.time(),
+                ),
+            )
+
+    def list_documents(self):
+
+        with self.connect() as connection:
+
+            return connection.execute(
+                """
+                SELECT
+                    file_name,
+                    page_count,
+                    added_at
+                FROM documents
+                ORDER BY added_at DESC
+                """
+            ).fetchall()
+
+
+# ============================================================
+# VECTOR STORE
+# ============================================================
+
+class FAISSVectorStore:
+
+    def __init__(
+        self,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    ) -> None:
+
+        logging.info(
+            "Loading embedding model: %s",
+            embedding_model,
+        )
+
+        self.encoder = SentenceTransformer(
+            embedding_model
+        )
+
+        self.index: Optional[
+            faiss.Index
+        ] = None
+
+        self.chunks: list[Chunk] = []
+
+    @property
+    def dimension(self) -> int:
+
+        return int(
+            self.encoder
+            .get_sentence_embedding_dimension()
+        )
+
+    def encode(
+        self,
+        texts: Iterable[str],
+    ) -> np.ndarray:
+
+        texts = list(texts)
+
+        vectors = self.encoder.encode(
+            texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+
+        vectors = np.asarray(
+            vectors,
+            dtype=np.float32,
+        )
+
+        if vectors.ndim == 1:
+
+            vectors = vectors.reshape(
+                1,
+                -1,
+            )
+
+        return vectors
+
+    def add_chunks(
+        self,
+        chunks: list[Chunk],
+    ) -> None:
+
+        if not chunks:
+            return
+
+        texts = [
+            chunk.text
+            for chunk in chunks
+        ]
+
+        embeddings = self.encode(
+            texts
+        )
+
+        if self.index is None:
+
+            self.index = faiss.IndexFlatIP(
+                self.dimension
+            )
+
+        self.index.add(
+            embeddings
+        )
+
+        self.chunks.extend(
+            chunks
+        )
+
+    def search(
+        self,
+        query: str,
+        top_k: int = DEFAULT_TOP_K,
+        lexical_weight: float = 0.10,
+    ) -> list[SearchResult]:
+
+        if (
+            self.index is None
+            or len(self.chunks) == 0
+        ):
+
+            return []
+
+        query_vector = self.encode(
+            [query]
+        )
+
+        candidate_k = min(
+            top_k * 3,
+            len(self.chunks),
+        )
+
+        scores, indices = self.index.search(
+            query_vector,
+            candidate_k,
+        )
+
+        results = []
+
+        for raw_score, raw_index in zip(
+            scores[0],
+            indices[0],
+        ):
+
+            index = int(raw_index)
+
+            if index < 0:
+                continue
+
+            chunk = self.chunks[index]
+
+            semantic_score = float(
+                raw_score
+            )
+
+            lexical_score = lexical_overlap(
+                query,
+                chunk.text,
+            )
+
+            # Semantic retrieval stays dominant.
+            combined_score = (
+                (1 - lexical_weight)
+                * semantic_score
+                + lexical_weight
+                * lexical_score
+            )
+
+            results.append(
+                SearchResult(
+                    chunk=chunk,
+                    score=combined_score,
+                    semantic_score=semantic_score,
+                    lexical_score=lexical_score,
+                )
+            )
+
+        results.sort(
+            key=lambda result: result.score,
+            reverse=True,
+        )
+
+        return results[:top_k]
+
+    def save(
+        self,
+        index_file: Path = INDEX_FILE,
+        chunks_file: Path = CHUNKS_FILE,
+    ) -> None:
+
+        if self.index is None:
+
+            raise RuntimeError(
+                "Cannot save an empty index."
+            )
+
+        faiss.write_index(
+            self.index,
+            str(index_file),
+        )
+
+        serializable_chunks = [
+            asdict(chunk)
+            for chunk in self.chunks
+        ]
+
+        chunks_file.write_text(
+            json.dumps(
+                serializable_chunks,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def load(
+        self,
+        index_file: Path = INDEX_FILE,
+        chunks_file: Path = CHUNKS_FILE,
+    ) -> bool:
+
+        if (
+            not index_file.exists()
+            or not chunks_file.exists()
+        ):
+
+            return False
+
+        self.index = faiss.read_index(
+            str(index_file)
+        )
+
+        raw_chunks = json.loads(
+            chunks_file.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.chunks = [
+            Chunk(**item)
+            for item in raw_chunks
+        ]
+
+        if self.index.ntotal != len(
+            self.chunks
+        ):
+
+            raise RuntimeError(
+                "FAISS index and chunk metadata "
+                "are inconsistent."
+            )
+
+        return True
+
+
+# ============================================================
+# OLLAMA LOCAL LLM
+# ============================================================
+
+class OllamaClient:
+
+    def __init__(
+        self,
+        base_url: str = DEFAULT_OLLAMA_URL,
+        model: str = DEFAULT_OLLAMA_MODEL,
+        timeout: int = 180,
+    ) -> None:
+
+        self.base_url = base_url.rstrip("/")
+
+        self.model = model
+
+        self.timeout = timeout
+
+    def health_check(self) -> None:
+
+        try:
+
+            response = requests.get(
+                f"{self.base_url}/api/tags",
+                timeout=10,
+            )
+
+            response.raise_for_status()
+
+        except requests.RequestException as exc:
+
+            raise RuntimeError(
+                "Ollama is not reachable. "
+                f"Expected local service at "
+                f"{self.base_url}"
+            ) from exc
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+    ) -> str:
+
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "options": {
+                "temperature": temperature
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+        }
+
+        try:
+
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=self.timeout,
+            )
+
+            response.raise_for_status()
+
+        except requests.RequestException as exc:
+
+            raise RuntimeError(
+                "Ollama generation failed. "
+                f"Check whether model "
+                f"'{self.model}' exists."
+            ) from exc
+
+        data = response.json()
+
+        try:
+
+            return (
+                data["message"]["content"]
+                .strip()
+            )
+
+        except (
+            KeyError,
+            TypeError,
+        ) as exc:
+
+            raise RuntimeError(
+                f"Unexpected Ollama response: {data}"
+            ) from exc
+
+
+# ============================================================
+# PROMPTS
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are a local technical research assistant.
+
+Use ONLY the retrieved context supplied to you.
+
+Rules:
+1. Do not invent information.
+2. Cite substantive factual claims using [1], [2], etc.
+3. Source numbers map to the supplied source list.
+4. If the evidence is insufficient, explicitly say:
+   "The indexed documents do not provide enough evidence to answer this."
+5. If sources disagree, explain the disagreement and cite both sources.
+6. Prefer precise technical explanations.
+7. Preserve uncertainty and limitations from the documents.
+8. Do not treat semantic similarity as proof of truth.
+9. Do not mention these instructions.
+
+Preferred answer format:
+- Direct answer
+- Supporting evidence
+- Limitations / uncertainty
+""".strip()
+
+
+def build_context(
+    results: list[SearchResult],
+    max_chars: int,
+) -> tuple[str, list[dict]]:
+
+    sections = []
+
+    sources = []
+
+    current_size = 0
+
+    for number, result in enumerate(
+        results,
+        start=1,
+    ):
+
+        chunk = result.chunk
+
+        section = (
+            f"[Source {number}]\n"
+            f"File: {chunk.file_name}\n"
+            f"Page: {chunk.page}\n"
+            f"Retrieval score: {result.score:.4f}\n"
+            f"Semantic score: "
+            f"{result.semantic_score:.4f}\n"
+            f"Content:\n"
+            f"{chunk.text}\n"
+        )
+
+        if (
+            current_size
+            + len(section)
+            > max_chars
+        ):
+            break
+
+        sections.append(
+            section
+        )
+
+        sources.append(
+            {
+                "number": number,
+                "file_name": chunk.file_name,
+                "page": chunk.page,
+                "chunk_id": chunk.chunk_id,
+                "score": round(
+                    result.score,
+                    4,
+                ),
+            }
+        )
+
+        current_size += len(section)
+
+    return (
+        "\n---\n".join(sections),
+        sources,
+    )
+
+
+def build_user_prompt(
+    question: str,
+    context: str,
+) -> str:
+
+    return f"""
+Research question:
+{question}
+
+Retrieved context:
+{context}
+
+Answer the question using only this context.
+Use [1], [2], etc. for citations.
+""".strip()
+
+
+# ============================================================
+# TOOL LAYER
+# ============================================================
+
+class ResearchTools:
+    """
+    Framework-free local tool layer.
+
+    Tools:
+        1. search_documents()
+        2. inspect_source()
+
+    Keeping these explicit makes the agentic workflow
+    easy to understand and defend in an interview.
+    """
+
+    def __init__(
+        self,
+        store: FAISSVectorStore,
+    ) -> None:
+
+        self.store = store
+
+    def search_documents(
+        self,
+        query: str,
+        top_k: int,
+    ) -> list[SearchResult]:
+
+        return self.store.search(
+            query=query,
+            top_k=top_k,
+        )
+
+    def inspect_source(
+        self,
+        file_name: str,
+        page: Optional[int] = None,
+        max_chars: int = 5000,
+    ) -> str:
+
+        matches = [
+            chunk
+            for chunk in self.store.chunks
+            if (
+                chunk.file_name.lower()
+                == file_name.lower()
+            )
+            and (
+                page is None
+                or chunk.page == page
+            )
+        ]
+
+        if not matches:
+
+            return (
+                "No indexed content found "
+                f"for {file_name!r}, "
+                f"page={page!r}."
+            )
+
+        matches.sort(
+            key=lambda chunk: (
+                chunk.page,
+                chunk.chunk_index,
+            )
+        )
+
+        output = []
+
+        remaining = max_chars
+
+        for chunk in matches:
+
+            if remaining <= 0:
+                break
+
+            block = (
+                f"File: {chunk.file_name}\n"
+                f"Page: {chunk.page}\n\n"
+                f"{chunk.text}\n"
+            )
+
+            block = block[:remaining]
+
+            output.append(block)
+
+            remaining -= len(block)
+
+        return "\n---\n".join(
+            output
+        )
+
+
+# ============================================================
+# LIGHTWEIGHT AGENT
+# ============================================================
+
+class ResearchAgent:
+
+    def __init__(
+        self,
+        tools: ResearchTools,
+        llm: OllamaClient,
+        max_context_chars: int = DEFAULT_MAX_CONTEXT,
+    ) -> None:
+
+        self.tools = tools
+        self.llm = llm
+        self.max_context_chars = (
+            max_context_chars
+        )
+
+    @staticmethod
+    def query_is_weak(
+        results: list[SearchResult],
+        threshold: float = 0.25,
+    ) -> bool:
+
+        if not results:
+            return True
+
+        return (
+            results[0].score
+            < threshold
+        )
+
+    @staticmethod
+    def expand_query(
+        question: str,
+    ) -> str:
+
+        # Framework-free query expansion.
+        #
+        # Useful for research questions where the
+        # original wording does not directly match
+        # terminology in the paper.
+
+        research_terms = [
+            "definition",
+            "methodology",
+            "results",
+            "evidence",
+            "limitations",
+        ]
+
+        return (
+            question.strip()
+            + " "
+            + " ".join(research_terms)
+        )
+
+    @staticmethod
+    def merge_results(
+        first: list[SearchResult],
+        second: list[SearchResult],
+        top_k: int,
+    ) -> list[SearchResult]:
+
+        best_by_id = {}
+
+        for result in first + second:
+
+            chunk_id = result.chunk.chunk_id
+
+            if (
+                chunk_id not in best_by_id
+                or result.score
+                > best_by_id[
+                    chunk_id
+                ].score
+            ):
+
+                best_by_id[
+                    chunk_id
+                ] = result
+
+        merged = list(
+            best_by_id.values()
+        )
+
+        merged.sort(
+            key=lambda result: result.score,
+            reverse=True,
+        )
+
+        return merged[:top_k]
+
+    def answer(
+        self,
+        question: str,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> dict:
+
+        start_time = time.perf_counter()
+
+        # ----------------------------------------------------
+        # STEP 1 — Initial retrieval
+        # ----------------------------------------------------
+
+        initial_results = (
+            self.tools.search_documents(
+                query=question,
+                top_k=top_k,
+            )
+        )
+
+        final_results = (
+            initial_results
+        )
+
+        used_expansion = False
+
+        # ----------------------------------------------------
+        # STEP 2 — Retrieval self-check
+        # ----------------------------------------------------
+
+        if self.query_is_weak(
+            initial_results
+        ):
+
+            expanded_question = (
+                self.expand_query(
+                    question
+                )
+            )
+
+            expanded_results = (
+                self.tools.search_documents(
+                    query=expanded_question,
+                    top_k=top_k,
+                )
+            )
+
+            final_results = (
+                self.merge_results(
+                    initial_results,
+                    expanded_results,
+                    top_k=top_k,
+                )
+            )
+
+            used_expansion = True
+
+        # ----------------------------------------------------
+        # STEP 3 — No evidence
+        # ----------------------------------------------------
+
+        if not final_results:
+
+            elapsed_ms = (
+                time.perf_counter()
+                - start_time
+            ) * 1000
+
+            return {
+                "answer": (
+                    "The indexed documents "
+                    "do not provide enough "
+                    "evidence to answer this."
+                ),
+                "sources": [],
+                "latency_ms": round(
+                    elapsed_ms,
+                    2,
+                ),
+                "query_expansion": (
+                    used_expansion
+                ),
+            }
+
+        # ----------------------------------------------------
+        # STEP 4 — Build context
+        # ----------------------------------------------------
+
+        context, sources = (
+            build_context(
+                results=final_results,
+                max_chars=(
+                    self.max_context_chars
+                ),
+            )
+        )
+
+        # ----------------------------------------------------
+        # STEP 5 — Local LLM synthesis
+        # ----------------------------------------------------
+
+        user_prompt = (
+            build_user_prompt(
+                question=question,
+                context=context,
+            )
+        )
+
+        answer_text = (
+            self.llm.generate(
+                system_prompt=(
+                    SYSTEM_PROMPT
+                ),
+                user_prompt=user_prompt,
+                temperature=0.1,
+            )
+        )
+
+        elapsed_ms = (
+            time.perf_counter()
+            - start_time
+        ) * 1000
+
+        return {
+            "answer": answer_text,
+            "sources": sources,
+            "latency_ms": round(
+                elapsed_ms,
+                2,
+            ),
+            "query_expansion": (
+                used_expansion
+            ),
+        }
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+def evaluate_retrieval(
+    store: FAISSVectorStore,
+    evaluation_file: Path,
+    top_k: int,
+) -> dict:
+    """
+    Simple retrieval evaluation.
+
+    JSONL example:
+        {
+            "question": "What methodology is used?",
+            "expected_terms": [
+                "methodology",
+                "proposed method"
+            ]
+        }
+
+    A query is counted as a hit when at least one
+    expected term occurs in the retrieved context.
+    """
+
+    total_queries = 0
+    successful_queries = 0
+
+    details = []
+
+    tools = ResearchTools(
+        store
+    )
+
+    with evaluation_file.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        for line_number, line in enumerate(
+            file,
+            start=1,
+        ):
+
+            if not line.strip():
+                continue
+
+            example = json.loads(
+                line
+            )
+
+            question = str(
+                example["question"]
+            )
+
+            expected_terms = [
+                str(term).lower()
+                for term in example.get(
+                    "expected_terms",
+                    [],
+                )
+            ]
+
+            results = (
+                tools.search_documents(
+                    query=question,
+                    top_k=top_k,
+                )
+            )
+
+            combined_text = " ".join(
+                result.chunk.text.lower()
+                for result in results
+            )
+
+            if expected_terms:
+
+                hit = any(
+                    term in combined_text
+                    for term in expected_terms
+                )
+
+            else:
+
+                hit = bool(results)
+
+            total_queries += 1
+
+            successful_queries += int(
+                hit
+            )
+
+            details.append(
+                {
+                    "line": line_number,
+                    "question": question,
+                    "hit": hit,
+                    "scores": [
+                        round(
+                            result.score,
+                            4,
+                        )
+                        for result in results
+                    ],
+                }
+            )
+
+    hit_at_k = (
+        successful_queries
+        / total_queries
+        if total_queries
+        else 0
+    )
+
+    return {
+        "queries": total_queries,
+        "hits": successful_queries,
+        "hit_at_k": round(
+            hit_at_k,
+            4,
+        ),
+        "details": details,
+    }
+
+
+# ============================================================
+# STORE LOADING
+# ============================================================
+
+def load_store(
+    embedding_model: str,
+) -> FAISSVectorStore:
+
+    store = FAISSVectorStore(
+        embedding_model
+    )
+
+    loaded = store.load()
+
+    if not loaded:
+
+        raise RuntimeError(
+            "No FAISS index found. "
+            "Run the ingest command first."
+        )
+
+    return store
+
+
+# ============================================================
+# INGEST COMMAND
+# ============================================================
+
+def command_ingest(
+    args: argparse.Namespace,
+) -> None:
+
+    ensure_directories()
+
+    docs_directory = (
+        Path(args.docs)
+        .expanduser()
+        .resolve()
+    )
+
+    if not docs_directory.exists():
+
+        raise FileNotFoundError(
+            f"Directory not found: "
+            f"{docs_directory}"
+        )
+
+    pdf_files = sorted(
+        docs_directory.glob(
+            "*.pdf"
+        )
+    )
+
+    if not pdf_files:
+
+        print(
+            f"No PDF files found in "
+            f"{docs_directory}"
+        )
+
+        return
+
+    database = LibraryDatabase()
+
+    store = FAISSVectorStore(
+        args.embedding_model
+    )
+
+    # Incremental loading:
+    # keep existing vectors if available.
+    store.load()
+
+    new_documents = 0
+    new_chunks = 0
+
+    for pdf_path in pdf_files:
+
+        digest = sha256_file(
+            pdf_path
+        )
+
+        if database.document_exists(
+            digest
+        ):
+
+            logging.info(
+                "Skipping existing PDF: %s",
+                pdf_path.name,
+            )
+
+            continue
+
+        logging.info(
+            "Processing PDF: %s",
+            pdf_path.name,
+        )
+
+        # Stable document ID based on file hash.
+        doc_id = hashlib.sha1(
+            digest.encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
+
+        chunks, page_count = (
+            build_document_chunks(
+                pdf_path=pdf_path,
+                doc_id=doc_id,
+                chunk_size=args.chunk_size,
+                overlap=args.overlap,
+            )
+        )
+
+        if not chunks:
+
+            logging.warning(
+                "No text extracted from %s",
+                pdf_path.name,
+            )
+
+            continue
+
+        record = DocumentRecord(
+            doc_id=doc_id,
+            file_name=pdf_path.name,
+            file_path=str(pdf_path),
+            sha256=digest,
+            page_count=page_count,
+            added_at=time.time(),
+        )
+
+        inserted = (
+            database.add_document(
+                record
+            )
+        )
+
+        if not inserted:
+
+            logging.info(
+                "Metadata already exists: %s",
+                pdf_path.name,
+            )
+
+            continue
+
+        store.add_chunks(
+            chunks
+        )
+
+        new_documents += 1
+
+        new_chunks += len(
+            chunks
+        )
+
+        logging.info(
+            "Added %s | pages=%d | chunks=%d",
+            pdf_path.name,
+            page_count,
+            len(chunks),
+        )
+
+    if store.chunks:
+
+        store.save()
+
+    print(
+        "\nIngestion completed."
+    )
+
+    print(
+        f"New documents: {new_documents}"
+    )
+
+    print(
+        f"New chunks: {new_chunks}"
+    )
+
+    print(
+        f"Total indexed chunks: "
+        f"{len(store.chunks)}"
+    )
+
+
+# ============================================================
+# ASK COMMAND
+# ============================================================
+
+def command_ask(
+    args: argparse.Namespace,
+) -> None:
+
+    ensure_directories()
+
+    store = load_store(
+        args.embedding_model
+    )
+
+    ollama = OllamaClient(
+        base_url=args.ollama_url,
+        model=args.ollama_model,
+        timeout=args.timeout,
+    )
+
+    ollama.health_check()
+
+    tools = ResearchTools(
+        store
+    )
+
+    agent = ResearchAgent(
+        tools=tools,
+        llm=ollama,
+        max_context_chars=(
+            args.max_context_chars
+        ),
+    )
+
+    database = LibraryDatabase()
+
+    result = agent.answer(
+        question=args.question,
+        top_k=args.top_k,
+    )
+
+    print(
+        "\n"
+        + "=" * 80
+    )
+
+    print(
+        "ANSWER"
+    )
+
+    print(
+        "=" * 80
+    )
+
+    print(
+        result["answer"]
+    )
+
+    print(
+        "\n"
+        + "-" * 80
+    )
+
+    print(
+        "SOURCES"
+    )
+
+    print(
+        "-" * 80
+    )
+
+    if result["sources"]:
+
+        for source in result["sources"]:
+
+            print(
+                f"[{source['number']}] "
+                f"{source['file_name']} "
+                f"| page {source['page']} "
+                f"| score "
+                f"{source['score']}"
+            )
+
+    else:
+
+        print(
+            "No sources retrieved."
+        )
+
+    print(
+        "\nLatency: "
+        f"{result['latency_ms']} ms"
+    )
+
+    print(
+        "Query expansion: "
+        f"{result['query_expansion']}"
+    )
+
+    database.log_query(
+        question=args.question,
+        answer=result["answer"],
+        retrieved_chunks=len(
+            result["sources"]
+        ),
+        latency_ms=result[
+            "latency_ms"
+        ],
+    )
+
+
+# ============================================================
+# INTERACTIVE COMMAND
+# ============================================================
+
+def command_interactive(
+    args: argparse.Namespace,
+) -> None:
+
+    store = load_store(
+        args.embedding_model
+    )
+
+    ollama = OllamaClient(
+        base_url=args.ollama_url,
+        model=args.ollama_model,
+        timeout=args.timeout,
+    )
+
+    ollama.health_check()
+
+    tools = ResearchTools(
+        store
+    )
+
+    agent = ResearchAgent(
+        tools=tools,
+        llm=ollama,
+        max_context_chars=(
+            args.max_context_chars
+        ),
+    )
+
+    database = LibraryDatabase()
+
+    print()
+    print(
+        "Local Research Intelligence"
+    )
+    print(
+        "Type a research question."
+    )
+    print(
+        "Type 'exit' or 'quit' to stop."
+    )
+    print()
+
+    while True:
+
+        try:
+
+            question = input(
+                "Research> "
+            ).strip()
+
+        except (
+            EOFError,
+            KeyboardInterrupt,
+        ):
+
+            print()
+            print(
+                "Exiting."
+            )
+
+            return
+
+        if question.lower() in {
+            "exit",
+            "quit",
+        }:
+
+            return
+
+        if not question:
+            continue
+
+        result = agent.answer(
+            question=question,
+            top_k=args.top_k,
+        )
+
+        print()
+        print(
+            result["answer"]
+        )
+
+        print()
+        print(
+            "Sources:"
+        )
+
+        for source in result[
+            "sources"
+        ]:
+
+            print(
+                f"  [{source['number']}] "
+                f"{source['file_name']} "
+                f"(page {source['page']})"
+            )
+
+        database.log_query(
+            question=question,
+            answer=result[
+                "answer"
+            ],
+            retrieved_chunks=len(
+                result["sources"]
+            ),
+            latency_ms=result[
+                "latency_ms"
+            ],
+        )
+
+        print()
+
+
+# ============================================================
+# SOURCE INSPECTION COMMAND
+# ============================================================
+
+def command_inspect(
+    args: argparse.Namespace,
+) -> None:
+
+    store = load_store(
+        args.embedding_model
+    )
+
+    tools = ResearchTools(
+        store
+    )
+
+    content = (
+        tools.inspect_source(
+            file_name=args.file,
+            page=args.page,
+            max_chars=args.max_chars,
+        )
+    )
+
+    print(
+        content
+    )
+
+
+# ============================================================
+# STATS COMMAND
+# ============================================================
+
+def command_stats(
+    args: argparse.Namespace,
+) -> None:
+
+    database = LibraryDatabase()
+
+    documents = (
+        database.list_documents()
+    )
+
+    print()
+    print(
+        "LIBRARY STATISTICS"
+    )
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Documents: "
+        f"{len(documents)}"
+    )
+
+    if documents:
+
+        for document in documents:
+
+            timestamp = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(
+                    document["added_at"]
+                ),
+            )
+
+            print(
+                f"- {document['file_name']} "
+                f"| {document['page_count']} pages "
+                f"| added {timestamp}"
+            )
+
+    if (
+        INDEX_FILE.exists()
+        and CHUNKS_FILE.exists()
+    ):
+
+        store = load_store(
+            args.embedding_model
+        )
+
+        print(
+            f"Indexed chunks: "
+            f"{len(store.chunks)}"
+        )
+
+        print(
+            f"Embedding dimension: "
+            f"{store.dimension}"
+        )
+
+    else:
+
+        print(
+            "Indexed chunks: 0"
+        )
+
+
+# ============================================================
+# EVALUATION COMMAND
+# ============================================================
+
+def command_evaluate(
+    args: argparse.Namespace,
+) -> None:
+
+    store = load_store(
+        args.embedding_model
+    )
+
+    results = evaluate_retrieval(
+        store=store,
+        evaluation_file=Path(
+            args.file
+        ),
+        top_k=args.top_k,
+    )
+
+    print(
+        json.dumps(
+            results,
+            indent=2,
+        )
+    )
+
+
+# ============================================================
+# RESET COMMAND
+# ============================================================
+
+def command_reset(
+    args: argparse.Namespace,
+) -> None:
+
+    files = [
+        INDEX_FILE,
+        CHUNKS_FILE,
+        DATABASE_FILE,
+    ]
+
+    deleted = 0
+
+    for path in files:
+
+        if path.exists():
+
+            path.unlink()
+
+            deleted += 1
+
+            logging.info(
+                "Deleted %s",
+                path,
+            )
+
+    print(
+        f"Reset completed. "
+        f"Deleted {deleted} files."
+    )
+
+
+# ============================================================
+# ARGUMENT PARSER
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Local Research Intelligence "
+            "& Agentic RAG"
+        )
+    )
+
+    parser.add_argument(
+        "--embedding-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="Sentence Transformer model.",
+    )
+
+    parser.add_argument(
+        "--ollama-url",
+        default=DEFAULT_OLLAMA_URL,
+        help="Local Ollama URL.",
+    )
+
+    parser.add_argument(
+        "--ollama-model",
+        default=DEFAULT_OLLAMA_MODEL,
+        help="Ollama model.",
+    )
+
+    subparsers = (
+        parser.add_subparsers(
+            dest="command",
+            required=True,
+        )
+    )
+
+    # --------------------------------------------------------
+    # INGEST
+    # --------------------------------------------------------
+
+    ingest_parser = (
+        subparsers.add_parser(
+            "ingest",
+            help=(
+                "Extract, chunk, embed, "
+                "and index PDFs."
+            ),
+        )
+    )
+
+    ingest_parser.add_argument(
+        "--docs",
+        default=str(
+            DOCUMENTS_DIR
+        ),
+        help="PDF directory.",
+    )
+
+    ingest_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+    )
+
+    ingest_parser.add_argument(
+        "--overlap",
+        type=int,
+        default=DEFAULT_CHUNK_OVERLAP,
+    )
+
+    ingest_parser.set_defaults(
+        func=command_ingest
+    )
+
+    # --------------------------------------------------------
+    # ASK
+    # --------------------------------------------------------
+
+    ask_parser = (
+        subparsers.add_parser(
+            "ask",
+            help="Ask one research question.",
+        )
+    )
+
+    ask_parser.add_argument(
+        "question",
+        help="Research question.",
+    )
+
+    ask_parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+    )
+
+    ask_parser.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=DEFAULT_MAX_CONTEXT,
+    )
+
+    ask_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+    )
+
+    ask_parser.set_defaults(
+        func=command_ask
+    )
+
+    # --------------------------------------------------------
+    # INTERACTIVE
+    # --------------------------------------------------------
+
+    interactive_parser = (
+        subparsers.add_parser(
+            "interactive",
+            help="Interactive research session.",
+        )
+    )
+
+    interactive_parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+    )
+
+    interactive_parser.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=DEFAULT_MAX_CONTEXT,
+    )
+
+    interactive_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+    )
+
+    interactive_parser.set_defaults(
+        func=command_interactive
+    )
+
+    # --------------------------------------------------------
+    # INSPECT
+    # --------------------------------------------------------
+
+    inspect_parser = (
+        subparsers.add_parser(
+            "inspect",
+            help="Inspect a source/page.",
+        )
+    )
+
+    inspect_parser.add_argument(
+        "--file",
+        required=True,
+        help="Exact PDF file name.",
+    )
+
+    inspect_parser.add_argument(
+        "--page",
+        type=int,
+        default=None,
+        help="1-based page number.",
+    )
+
+    inspect_parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=5000,
+    )
+
+    inspect_parser.set_defaults(
+        func=command_inspect
+    )
+
+    # --------------------------------------------------------
+    # STATS
+    # --------------------------------------------------------
+
+    stats_parser = (
+        subparsers.add_parser(
+            "stats",
+            help="Show library statistics.",
+        )
+    )
+
+    stats_parser.set_defaults(
+        func=command_stats
+    )
+
+    # --------------------------------------------------------
+    # EVALUATE
+    # --------------------------------------------------------
+
+    evaluate_parser = (
+        subparsers.add_parser(
+            "evaluate",
+            help="Evaluate retrieval.",
+        )
+    )
+
+    evaluate_parser.add_argument(
+        "file",
+        help="Evaluation JSONL.",
+    )
+
+    evaluate_parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+    )
+
+    evaluate_parser.set_defaults(
+        func=command_evaluate
+    )
+
+    # --------------------------------------------------------
+    # RESET
+    # --------------------------------------------------------
+
+    reset_parser = (
+        subparsers.add_parser(
+            "reset",
+            help="Reset index and history.",
+        )
+    )
+
+    reset_parser.set_defaults(
+        func=command_reset
+    )
+
+    return parser
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> int:
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=LOG_FORMAT,
+    )
+
+    parser = build_parser()
+
+    args = parser.parse_args()
+
+    try:
+
+        args.func(args)
+
+        return 0
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nInterrupted."
+        )
+
+        return 130
+
+    except Exception as exc:
+
+        logging.error(
+            "Application error: %s",
+            exc,
+        )
+
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
